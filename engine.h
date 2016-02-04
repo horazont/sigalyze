@@ -1,6 +1,7 @@
 #ifndef ENGINE_H
 #define ENGINE_H
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -183,8 +184,14 @@ private:
     uint32_t m_sample_rate;
     std::vector<float> m_sample_buffer;
 
+    std::array<float, 32> m_backlog;
+    decltype(m_backlog)::size_type m_backlog_index;
+
 private slots:
     void process_samples(SampleBlock data);
+
+private:
+    float get_recent_peak();
 
 signals:
     void result_available(RMSBlock data);
@@ -216,6 +223,60 @@ public:
 };
 
 
+class AbstractOutputDriver: public QObject
+{
+    Q_OBJECT
+public:
+    using QObject::QObject;
+
+public:
+    virtual uint32_t sample_rate() = 0;
+    virtual global_clock::time_point time() = 0;
+
+public:
+    virtual void samples_available(const std::vector<float> &samples);
+
+};
+
+
+class AudioOutputDriver: public AbstractOutputDriver
+{
+    Q_OBJECT
+public:
+    explicit AudioOutputDriver(
+            std::unique_ptr<QAudioOutput> &&output,
+            int32_t buffer_msecs = 100,
+            uint32_t drop_msecs = 1000,
+            QObject *parent = nullptr);
+
+private:
+    std::unique_ptr<QAudioOutput> m_output;
+    QIODevice *m_sink;
+    int64_t m_samples_written;
+    uint32_t m_drop_samples;
+    std::chrono::microseconds m_buffer_delay;
+    std::chrono::microseconds m_dropped;
+    global_clock::time_point m_t0;
+    std::atomic<global_clock::time_point> m_time;
+    std::vector<float> m_outer_buffer;
+
+    int m_clock_timer;
+
+public:
+    void samples_available(const std::vector<float> &samples) override;
+
+    // QObject interface
+protected:
+    void timerEvent(QTimerEvent *);
+
+    // AbstractOutputDriver interface
+public:
+    uint32_t sample_rate() override;
+    std::chrono::_V2::steady_clock::time_point time() override;
+
+};
+
+
 class Engine: public QObject
 {
     Q_OBJECT
@@ -227,17 +288,7 @@ public:
 private:
     std::unique_ptr<VirtualAudioSource> m_source;
     QAudioDeviceInfo m_output_device_info;
-    std::unique_ptr<QAudioOutput> m_output;
-    QIODevice *m_output_sink;
-
-    int m_clock_timer;
-
-    int64_t m_output_latency;
-    int64_t m_output_samples_written;
-    int32_t m_target_output_latency;
-    std::chrono::microseconds m_output_delay;
-    global_clock::time_point m_output_t0;
-    global_clock::time_point m_output_time;
+    std::unique_ptr<AbstractOutputDriver> m_sink;
 
 private:
     void reopen_output();
@@ -245,19 +296,10 @@ private:
 private slots:
     void on_samples_available(const SampleBlock *samples);
 
-    // QObject interface
-protected:
-    void timerEvent(QTimerEvent *ev);
-
 public:
-    inline int64_t output_latency() const
-    {
-        return m_output_latency;
-    }
-
     inline global_clock::time_point output_time() const
     {
-        return m_output_time;
+        return (m_sink ? m_sink->time() : global_clock::now());
     }
 
     void resume();

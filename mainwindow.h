@@ -10,14 +10,27 @@
 #include "engine.h"
 
 
+struct VisualisationContext
+{
+    float dB_min;
+    float dB_max;
+
+    float map_db(float dB) const;
+};
+
+
 class RMSWidget: public QWidget
 {
     Q_OBJECT
 public:
-    explicit RMSWidget(const Engine &engine, QWidget *parent = nullptr);
+    explicit RMSWidget(
+            const Engine &engine,
+            const VisualisationContext &context,
+            QWidget *parent = nullptr);
 
 private:
     const Engine &m_engine;
+    const VisualisationContext &m_context;
     TimedDataQueue<RMSBlock> m_queue;
     RMSBlock m_most_recent;
 
@@ -43,8 +56,8 @@ private:
     QLabel *m_latency_label;
     RMSWidget *m_rms;
 
-    QThread m_audio_thread;
     Engine m_engine;
+    VisualisationContext m_context;
     OpenAudioDeviceDialog m_audio_device_dialog;
 
     RootMeanSquare m_rms_calc;
