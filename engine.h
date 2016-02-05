@@ -2,6 +2,7 @@
 #define ENGINE_H
 
 #include <atomic>
+#include <complex>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -14,6 +15,7 @@
 #include <QThread>
 #include <QObject>
 
+#include "fftw3.h"
 
 typedef std::chrono::steady_clock global_clock;
 
@@ -31,9 +33,9 @@ struct SampleBlock: public TimestampedData
 };
 
 
-struct FFTBlock: public TimestampedData
+struct RealFFTBlock: public TimestampedData
 {
-    std::vector<float> fft;
+    std::vector<double> fft;
     float fmax;
 };
 
@@ -154,7 +156,7 @@ public:
     inline void push_block(data_t &&block)
     {
         if (m_blocks.size() >= m_max_blocks) {
-            return;
+            m_blocks.pop();
         }
         m_blocks.emplace(std::move(block));
     }
@@ -216,6 +218,71 @@ private:
 
 public:
     inline const RMSProcessor &processor() const
+    {
+        return m_processor;
+    }
+
+};
+
+
+class FFTProcessor: public QObject
+{
+    Q_OBJECT
+public:
+    FFTProcessor() = delete;
+    explicit FFTProcessor(const Engine &engine,
+                          uint32_t size,
+                          uint32_t period_msec);
+    FFTProcessor(const FFTProcessor &other) = delete;
+    FFTProcessor(FFTProcessor &&src) = delete;
+    FFTProcessor &operator=(const FFTProcessor &other) = delete;
+    FFTProcessor &operator=(FFTProcessor &&src) = delete;
+
+private:
+    std::vector<double> m_in;
+    std::vector<std::complex<double> > m_out_buffer;
+    const uint32_t m_size;
+    fftw_plan m_plan;
+    uint32_t m_period_msec;
+    global_clock::time_point m_t;
+    uint32_t m_sample_rate;
+    uint32_t m_shift_remaining;
+
+    std::vector<double> m_in_buffer;
+    std::vector<double> m_window;
+    RealFFTBlock m_out;
+
+private:
+    void make_window(std::vector<double> &dest);
+
+private slots:
+    void process_samples(SampleBlock data);
+
+signals:
+    void result_available(RealFFTBlock data);
+
+};
+
+
+class FFT: public QThread
+{
+    Q_OBJECT
+
+public:
+    FFT() = delete;
+    explicit FFT(const Engine &engine,
+                 uint32_t size,
+                 uint32_t period_msec);
+    FFT(const FFT &other) = delete;
+    FFT(FFT &&src) = delete;
+    FFT &operator=(const FFT &other) = delete;
+    FFT &operator=(FFT &&src) = delete;
+
+private:
+    FFTProcessor m_processor;
+
+public:
+    inline const FFTProcessor &processor() const
     {
         return m_processor;
     }

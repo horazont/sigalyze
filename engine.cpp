@@ -1,6 +1,8 @@
+#include <ccomplex>
 #include "engine.h"
 
 #include <cassert>
+#include <cstring>
 #include <iostream>
 
 #include <QAudioOutput>
@@ -58,6 +60,7 @@ public:
     }
 
 };
+
 
 
 AbstractSampleConverter::~AbstractSampleConverter()
@@ -321,6 +324,110 @@ RootMeanSquare::RootMeanSquare(const Engine &engine):
     start();
     m_processor.moveToThread(this);
 }
+
+
+/* FFTProcessor */
+
+FFTProcessor::FFTProcessor(const Engine &engine,
+                           uint32_t size,
+                           uint32_t period_msec):
+    m_in(size),
+    m_out_buffer(size/2+1),
+    m_size(size),
+    m_plan(fftw_plan_dft_r2c_1d(size, m_in.data(), reinterpret_cast<fftw_complex*>(m_out_buffer.data()), 0)),
+    m_period_msec(period_msec),
+    m_sample_rate(0),
+    m_shift_remaining(0),
+    m_window(size)
+{
+    connect(&engine, &Engine::samples_available,
+            this, &FFTProcessor::process_samples,
+            Qt::QueuedConnection);
+    make_window(m_window);
+}
+
+void FFTProcessor::make_window(std::vector<double> &dest)
+{
+    static constexpr float a0 = 0.3635819;
+    static constexpr float a1 = 0.4891775;
+    static constexpr float a2 = 0.1365995;
+    static constexpr float a3 = 0.0106411;
+    const unsigned int N = dest.size();
+    for (unsigned int n = 0; n < N; ++n) {
+        dest[n] = a0 - a1*std::cos(2*M_PIl*n/(N-1)) + a2*std::cos(4*M_PIl*n/(N-1)) + a3*std::cos(6*M_PIl*n/(N-1));
+    }
+}
+
+void FFTProcessor::process_samples(SampleBlock data)
+{
+    if (m_sample_rate != data.sample_rate) {
+        m_in_buffer.clear();
+        m_sample_rate = data.sample_rate;
+        m_t = data.t;
+        m_shift_remaining = 0;
+    }
+
+    if (m_in_buffer.empty()) {
+        // use the opportunity for a resync
+        m_t = data.t;
+    }
+
+    if (m_shift_remaining > 0 and m_shift_remaining >= data.samples.size()) {
+        m_shift_remaining -= data.samples.size();
+        m_t += std::chrono::microseconds(data.samples.size() * 1000000 / m_sample_rate);
+        return;
+    }
+
+    m_in_buffer.reserve(m_in_buffer.size() + data.samples.size() - m_shift_remaining);
+    std::copy(data.samples.begin()+m_shift_remaining, data.samples.end(),
+              std::back_inserter(m_in_buffer));
+    m_t += std::chrono::microseconds(m_shift_remaining * 1000000 / m_sample_rate);
+    m_shift_remaining = 0;
+
+    const uint32_t shift = m_period_msec * m_sample_rate / 1000;
+    const uint32_t size = m_size;
+
+    while (m_in_buffer.size() >= m_size) {
+        for (unsigned int i = 0; i < m_size; ++i) {
+            m_in[i] = m_in_buffer[i] * m_window[i];
+        }
+        fftw_execute(m_plan);
+        m_out.t = m_t;
+        m_out.fmax = (float)m_sample_rate / 2;
+        m_out.fft.clear();
+
+        std::transform(m_out_buffer.begin(),
+                       m_out_buffer.end(),
+                       std::back_inserter(m_out.fft),
+                       [size](const std::complex<double> &v){ return std::abs(v) / size; });
+
+        emit result_available(m_out);
+
+        if (shift >= m_in_buffer.size()) {
+            m_shift_remaining = shift - m_in_buffer.size();
+            m_t += std::chrono::microseconds(m_in_buffer.size() * 1000000 / m_sample_rate);
+            m_in_buffer.clear();
+            return;
+        }
+
+        m_in_buffer.erase(m_in_buffer.begin(),
+                          m_in_buffer.begin() + shift);
+
+        m_t += std::chrono::microseconds(shift * 1000000 / m_sample_rate);
+    }
+}
+
+
+/* FFT */
+
+FFT::FFT(const Engine &engine, uint32_t size, uint32_t period_msec):
+    m_processor(engine, size, period_msec)
+{
+    start();
+    m_processor.moveToThread(this);
+}
+
+
 
 
 /* AbstractOutputDriver */

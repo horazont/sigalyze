@@ -1,0 +1,8 @@
+<RCC>
+    <qresource prefix="/shaders">
+        <file>fft.frag</file>
+        <file>fft.vert</file>
+        <file>waterfall.frag</file>
+        <file>waterfall.vert</file>
+    </qresource>
+</RCC>

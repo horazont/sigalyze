@@ -25,3 +25,17 @@ FORMS    += mainwindow.ui \
     openaudiodevicedialog.ui
 
 QMAKE_CXXFLAGS += -std=c++14
+
+unix: CONFIG += link_pkgconfig
+unix: PKGCONFIG += fftw3
+
+DISTFILES += \
+    fft.frag \
+    fft.vert \
+    waterfall.vert \
+    waterfall.frag
+
+RESOURCES += \
+    data.qrc
+
+unix: PKGCONFIG += epoxy
