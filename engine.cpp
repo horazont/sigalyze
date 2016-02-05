@@ -177,6 +177,26 @@ AudioInputSource::~AudioInputSource()
     m_input->stop();
 }
 
+void AudioInputSource::downmix_to_mono(const std::vector<float> &src,
+                                       std::vector<float> &dest)
+{
+    const uint32_t channels = m_input->format().channelCount();
+    if (channels == 1) {
+        dest = src;
+        return;
+    }
+
+    dest.resize(src.size() / channels);
+    assert(src.size() % channels == 0);
+    for (uint32_t i = 0; i < src.size() / channels; ++i) {
+        float accum = 0.f;
+        for (uint32_t j = 0; j < channels; ++j) {
+            accum += src[i*channels+j];
+        }
+        dest[i] = accum;
+    }
+}
+
 void AudioInputSource::timerEvent(QTimerEvent *ev)
 {
     if (ev->timerId() == m_sampling_timer) {
@@ -184,6 +204,11 @@ void AudioInputSource::timerEvent(QTimerEvent *ev)
     } else {
         std::cout << "unknown timer: " << ev->timerId() << std::endl;
     }
+}
+
+uint32_t AudioInputSource::channel_count() const
+{
+    return m_input->format().channelCount();
 }
 
 void AudioInputSource::on_notify()
@@ -198,18 +223,22 @@ void AudioInputSource::on_notify()
             m_converter->read_and_convert(
                         m_source,
                         m_input->periodSize(),
-                        m_buffer.samples);
+                        m_buffer.original_samples);
         } else {
-            m_buffer.samples.resize(m_input->periodSize() / sizeof(float));
+            m_buffer.original_samples.resize(m_input->periodSize() / sizeof(float));
             int64_t bytes_read = m_source->read(
-                        (char*)m_buffer.samples.data(),
-                        m_buffer.samples.size() * sizeof(float));
+                        (char*)m_buffer.original_samples.data(),
+                        m_buffer.original_samples.size() * sizeof(float));
             assert(bytes_read % sizeof(float) == 0);
-            m_buffer.samples.resize(bytes_read / sizeof(float));
+            m_buffer.original_samples.resize(bytes_read / sizeof(float));
         }
-        if (m_buffer.samples.empty()) {
+        if (m_buffer.original_samples.empty()) {
             return;
         }
+
+        downmix_to_mono(m_buffer.original_samples,
+                        m_buffer.mono_samples);
+
         samples_available(&m_buffer);
     }
 }
@@ -270,12 +299,12 @@ void RMSProcessor::process_samples(SampleBlock data)
 {
     if (m_sample_buffer.empty() || m_sample_rate != data.sample_rate) {
         m_sample_rate = data.sample_rate;
-        m_sample_buffer = std::move(data.samples);
+        m_sample_buffer = std::move(data.mono_samples);
         m_t0 = data.t;
         assert(data.t >= m_t0);
     } else {
-        std::copy(data.samples.begin(),
-                  data.samples.end(),
+        std::copy(data.mono_samples.begin(),
+                  data.mono_samples.end(),
                   std::back_inserter(m_sample_buffer));
     }
 
@@ -323,6 +352,7 @@ RootMeanSquare::RootMeanSquare(const Engine &engine):
 {
     start();
     m_processor.moveToThread(this);
+    setObjectName("sigalyze [RMS]");
 }
 
 
@@ -372,14 +402,14 @@ void FFTProcessor::process_samples(SampleBlock data)
         m_t = data.t;
     }
 
-    if (m_shift_remaining > 0 and m_shift_remaining >= data.samples.size()) {
-        m_shift_remaining -= data.samples.size();
-        m_t += std::chrono::microseconds(data.samples.size() * 1000000 / m_sample_rate);
+    if (m_shift_remaining > 0 and m_shift_remaining >= data.mono_samples.size()) {
+        m_shift_remaining -= data.mono_samples.size();
+        m_t += std::chrono::microseconds(data.mono_samples.size() * 1000000 / m_sample_rate);
         return;
     }
 
-    m_in_buffer.reserve(m_in_buffer.size() + data.samples.size() - m_shift_remaining);
-    std::copy(data.samples.begin()+m_shift_remaining, data.samples.end(),
+    m_in_buffer.reserve(m_in_buffer.size() + data.mono_samples.size() - m_shift_remaining);
+    std::copy(data.mono_samples.begin()+m_shift_remaining, data.mono_samples.end(),
               std::back_inserter(m_in_buffer));
     m_t += std::chrono::microseconds(m_shift_remaining * 1000000 / m_sample_rate);
     m_shift_remaining = 0;
@@ -425,6 +455,7 @@ FFT::FFT(const Engine &engine, uint32_t size, uint32_t period_msec):
 {
     start();
     m_processor.moveToThread(this);
+    setObjectName(QString("sigalyze [FFT size=%1, period=%2ms]").arg(size).arg(period_msec));
 }
 
 
@@ -467,8 +498,6 @@ AudioOutputDriver::AudioOutputDriver(
 
 void AudioOutputDriver::samples_available(const std::vector<float> &samples)
 {
-    // std::cout << samples.size() << std::endl;
-
     if (!m_outer_buffer.empty()) {
         int64_t written = m_sink->write(
                     (const char*)m_outer_buffer.data(),
@@ -557,7 +586,7 @@ void Engine::reopen_output()
     QAudioFormat fmt = m_output_device_info.preferredFormat();
     fmt.setSampleType(QAudioFormat::Float);
     fmt.setSampleSize(32);
-    fmt.setChannelCount(1);
+    fmt.setChannelCount(m_source->channel_count());
     fmt.setCodec("audio/pcm");
     fmt.setByteOrder(QAudioFormat::LittleEndian);
     fmt.setSampleRate(m_source->sample_rate());
@@ -575,7 +604,7 @@ void Engine::reopen_output()
 void Engine::on_samples_available(const SampleBlock *samples)
 {
     if (m_sink) {
-        m_sink->samples_available(samples->samples);
+        m_sink->samples_available(samples->original_samples);
     }
     samples_available(*samples);
 }

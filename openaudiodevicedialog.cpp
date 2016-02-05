@@ -170,7 +170,7 @@ void OpenAudioDeviceDialog::accept()
     m_selected_format = m_selected_device.preferredFormat();
     m_selected_format.setByteOrder(QAudioFormat::LittleEndian);
     m_selected_format.setCodec("audio/pcm");
-    m_selected_format.setChannelCount(1);
+    m_selected_format.setChannelCount(2);
     m_selected_format.setSampleRate(ui.sample_rate->currentData().toInt());
     m_selected_format.setSampleSize(ui.sample_size->currentData().toInt());
     m_selected_format.setSampleType((QAudioFormat::SampleType)ui.sample_type->currentData().toInt());

@@ -29,7 +29,8 @@ struct TimestampedData
 struct SampleBlock: public TimestampedData
 {
     uint32_t sample_rate;
-    std::vector<float> samples;
+    std::vector<float> mono_samples;
+    std::vector<float> original_samples;
 };
 
 
@@ -55,6 +56,7 @@ public:
     virtual ~VirtualAudioSource() = default;
 
 public:
+    virtual uint32_t channel_count() const = 0;
     virtual bool is_seekable() const;
     virtual void pause() = 0;
     virtual bool read_samples(uint64_t start, uint64_t count,
@@ -107,6 +109,7 @@ private:
     int m_sampling_timer;
 
 private:
+    void downmix_to_mono(const std::vector<float> &src, std::vector<float> &dest);
     void on_notify();
 
     // QObject interface
@@ -114,6 +117,7 @@ protected:
     void timerEvent(QTimerEvent *ev);
 
 public:
+    uint32_t channel_count() const;
     void pause();
     void resume();
     uint32_t sample_rate() const;
