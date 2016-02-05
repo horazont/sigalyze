@@ -31,6 +31,8 @@
     </property>
     <addaction name="action_open_file"/>
     <addaction name="action_open_audio_device"/>
+    <addaction name="separator"/>
+    <addaction name="action_quit"/>
    </widget>
    <addaction name="menuFile"/>
   </widget>
@@ -43,6 +45,11 @@
   <action name="action_open_audio_device">
    <property name="text">
     <string>Open audio &amp;device…</string>
+   </property>
+  </action>
+  <action name="action_quit">
+   <property name="text">
+    <string>Quit</string>
    </property>
   </action>
  </widget>

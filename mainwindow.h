@@ -169,6 +169,8 @@ private slots:
 
 
     // QObject interface
+    void on_action_quit_triggered();
+
 protected:
     void timerEvent(QTimerEvent *ev);
 };

@@ -429,3 +429,8 @@ void MainWindow::timerEvent(QTimerEvent *ev)
     }
     QMainWindow::timerEvent(ev);
 }
+
+void MainWindow::on_action_quit_triggered()
+{
+    close();
+}
