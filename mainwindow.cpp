@@ -407,7 +407,10 @@ MainWindow::MainWindow(QWidget *parent) :
 void MainWindow::on_action_open_audio_device_triggered()
 {
     m_audio_device_dialog.refresh();
-    m_audio_device_dialog.exec();
+    if (m_audio_device_dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
     m_engine.set_source(std::make_unique<AudioInputSource>(std::make_unique<QAudioInput>(
                                                                m_audio_device_dialog.device(),
                                                                m_audio_device_dialog.format()
