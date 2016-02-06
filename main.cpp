@@ -8,8 +8,10 @@
 
 int main(int argc, char *argv[])
 {
-    qRegisterMetaType<SampleBlock>("SampleBlock");
+    qRegisterMetaType<std::shared_ptr<const SampleBlock> >("std::shared_ptr<const SampleBlock>");
+    qRegisterMetaType<std::shared_ptr<const RMSBlock> >("std::shared_ptr<const RMSBlock>");
     qRegisterMetaType<RMSBlock>("RMSBlock");
+    qRegisterMetaType<std::shared_ptr<const RealFFTBlock> >("std::shared_ptr<const RealFFTBlock>");
     qRegisterMetaType<RealFFTBlock>("RealFFTBlock");
 
     QSurfaceFormat fmt;

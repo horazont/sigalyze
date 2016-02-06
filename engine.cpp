@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <thread>
 
 #include <QAudioOutput>
 #include <QTimerEvent>
@@ -40,7 +41,7 @@ private:
     std::vector<int_t> m_buffer;
 
 public:
-    void read_and_convert(QIODevice *source,
+    bool read_and_convert(QIODevice *source,
                           uint32_t bytes_to_read,
                           std::vector<float> &dest) override
     {
@@ -49,18 +50,38 @@ public:
         m_buffer.resize(samples_to_read);
 
         const uint32_t bytes_total = samples_to_read*sizeof(int_t);
-        const uint64_t bytes_read = source->read(
+        const int64_t bytes_read = source->read(
                     (char*)m_buffer.data(),
                     bytes_total);
+        if (bytes_read == -1) {
+            return false;
+        }
 
         assert(bytes_read % sizeof(int_t) == 0);
         m_buffer.resize(bytes_read / sizeof(int_t));
 
         sample_converter<int_t>::convert(m_buffer, dest);
+        return true;
     }
 
 };
 
+/* VirtualAudioSource */
+
+bool VirtualAudioSource::is_seekable() const
+{
+    return false;
+}
+
+bool VirtualAudioSource::seek(const uint64_t)
+{
+    return false;
+}
+
+uint64_t VirtualAudioSource::tell() const
+{
+    return 0;
+}
 
 
 AbstractSampleConverter::~AbstractSampleConverter()
@@ -124,35 +145,6 @@ std::unique_ptr<AbstractSampleConverter> AbstractSampleConverter::make_converter
 }
 
 
-
-/* VirtualAudioSource */
-
-bool VirtualAudioSource::is_seekable() const
-{
-    return false;
-}
-
-bool VirtualAudioSource::read_samples(uint64_t, uint64_t, std::vector<float>&)
-{
-    return false;
-}
-
-uint64_t VirtualAudioSource::samples() const
-{
-    return 0;
-}
-
-void VirtualAudioSource::seek(uint64_t)
-{
-
-}
-
-QAudio::State VirtualAudioSource::state() const
-{
-    return QAudio::StoppedState;
-}
-
-
 /* AudioInputSource */
 
 AudioInputSource::AudioInputSource(std::unique_ptr<QAudioInput> &&from, QObject *parent):
@@ -164,46 +156,18 @@ AudioInputSource::AudioInputSource(std::unique_ptr<QAudioInput> &&from, QObject 
                                                 m_input->format().sampleSize())
         )
 {
-    connect(m_input.get(), &QAudioInput::stateChanged,
-            this, &AudioInputSource::state_changed);
     m_input->setVolume(0.001);
-    m_buffer.sample_rate = m_input->format().sampleRate();
 }
 
 AudioInputSource::~AudioInputSource()
 {
-    killTimer(m_sampling_timer);
-    m_source = nullptr;
-    m_input->stop();
+    stop();
 }
 
-void AudioInputSource::downmix_to_mono(const std::vector<float> &src,
-                                       std::vector<float> &dest)
+global_clock::time_point AudioInputSource::time() const
 {
-    const uint32_t channels = m_input->format().channelCount();
-    if (channels == 1) {
-        dest = src;
-        return;
-    }
-
-    dest.resize(src.size() / channels);
-    assert(src.size() % channels == 0);
-    for (uint32_t i = 0; i < src.size() / channels; ++i) {
-        float accum = 0.f;
-        for (uint32_t j = 0; j < channels; ++j) {
-            accum += src[i*channels+j];
-        }
-        dest[i] = accum;
-    }
-}
-
-void AudioInputSource::timerEvent(QTimerEvent *ev)
-{
-    if (ev->timerId() == m_sampling_timer) {
-        on_notify();
-    } else {
-        std::cout << "unknown timer: " << ev->timerId() << std::endl;
-    }
+    //return m_t0 + std::chrono::microseconds(m_frames_read * 1000000 / (uint64_t)m_input->format().sampleRate());
+    return m_t0 + std::chrono::microseconds(m_input->processedUSecs()) - m_buffer_delay;
 }
 
 uint32_t AudioInputSource::channel_count() const
@@ -211,74 +175,61 @@ uint32_t AudioInputSource::channel_count() const
     return m_input->format().channelCount();
 }
 
-void AudioInputSource::on_notify()
-{
-    if (!m_source) {
-        return;
-    }
-
-    while (m_input->bytesReady()) {
-        m_buffer.t = global_clock::now();
-        if (m_converter) {
-            m_converter->read_and_convert(
-                        m_source,
-                        m_input->periodSize(),
-                        m_buffer.original_samples);
-        } else {
-            m_buffer.original_samples.resize(m_input->periodSize() / sizeof(float));
-            int64_t bytes_read = m_source->read(
-                        (char*)m_buffer.original_samples.data(),
-                        m_buffer.original_samples.size() * sizeof(float));
-            assert(bytes_read % sizeof(float) == 0);
-            m_buffer.original_samples.resize(bytes_read / sizeof(float));
-        }
-        if (m_buffer.original_samples.empty()) {
-            return;
-        }
-
-        downmix_to_mono(m_buffer.original_samples,
-                        m_buffer.mono_samples);
-
-        samples_available(&m_buffer);
-    }
-}
-
-void AudioInputSource::pause()
-{
-    m_input->suspend();
-    m_input->reset();
-    killTimer(m_sampling_timer);
-}
-
-void AudioInputSource::resume()
-{
-    m_input->resume();
-    m_sampling_timer = startTimer(SAMPLING_INTERVAL, Qt::PreciseTimer);
-}
-
 uint32_t AudioInputSource::sample_rate() const
 {
     return m_input->format().sampleRate();
 }
 
+std::pair<bool, global_clock::time_point> AudioInputSource::read_samples(
+        std::vector<float> &dest)
+{
+    if (!m_source) {
+        return std::make_pair(false, global_clock::time_point());
+    }
+
+    const uint32_t channel_count = m_input->format().channelCount();
+    const int64_t frames_to_read = std::max(
+                dest.capacity() / channel_count,
+                m_input->periodSize() / sizeof(float) / channel_count
+                );
+    const int64_t bytes_to_read = frames_to_read * sizeof(float) * channel_count;
+    const global_clock::time_point t = time();
+    m_source->waitForReadyRead(-1);
+    if (m_converter) {
+        if (!m_converter->read_and_convert(
+                    m_source,
+                    bytes_to_read,
+                    dest))
+        {
+            return std::make_pair(false, global_clock::time_point());
+        }
+        assert(dest.size() % channel_count == 0);
+    } else {
+        dest.resize(frames_to_read * channel_count);
+        int64_t bytes_read = m_source->read(
+                    (char*)dest.data(),
+                    bytes_to_read);
+        if (bytes_read < 0) {
+            return std::make_pair(false, global_clock::time_point());
+        }
+
+        assert(bytes_read % (sizeof(float)*channel_count) == 0);
+        dest.resize(bytes_read / sizeof(float));
+    }
+    m_frames_read += dest.size() / channel_count;
+    return std::make_pair(true, t);
+}
+
 void AudioInputSource::start()
 {
     m_source = m_input->start();
-    if (!m_source) {
-        throw std::runtime_error("failed to start source");
-    }
-    std::cout << "opened! notify interval: " << m_input->notifyInterval() << std::endl;
-    m_sampling_timer = startTimer(SAMPLING_INTERVAL, Qt::PreciseTimer);
-}
-
-QAudio::State AudioInputSource::state() const
-{
-    return m_input->state();
+    m_t0 = global_clock::now();
+    m_buffer_delay = std::chrono::microseconds(
+                m_input->bufferSize() / sizeof(float) * 1000000 / m_input->format().sampleRate() / m_input->format().channelCount());
 }
 
 void AudioInputSource::stop()
 {
-    killTimer(m_sampling_timer);
     m_source = nullptr;
     m_input->stop();
 }
@@ -295,11 +246,12 @@ RMSProcessor::RMSProcessor(const Engine &engine):
             Qt::QueuedConnection);
 }
 
-void RMSProcessor::process_samples(SampleBlock data)
+void RMSProcessor::process_samples(std::shared_ptr<const SampleBlock> input_block)
 {
+    const SampleBlock &data = *input_block;
     if (m_sample_buffer.empty() || m_sample_rate != data.sample_rate) {
         m_sample_rate = data.sample_rate;
-        m_sample_buffer = std::move(data.mono_samples);
+        m_sample_buffer = data.mono_samples;
         m_t0 = data.t;
         assert(data.t >= m_t0);
     } else {
@@ -350,9 +302,9 @@ float RMSProcessor::get_recent_peak()
 RootMeanSquare::RootMeanSquare(const Engine &engine):
     m_processor(engine)
 {
+    setObjectName("sigalyze [RMS]");
     start();
     m_processor.moveToThread(this);
-    setObjectName("sigalyze [RMS]");
 }
 
 
@@ -388,8 +340,10 @@ void FFTProcessor::make_window(std::vector<double> &dest)
     }
 }
 
-void FFTProcessor::process_samples(SampleBlock data)
+void FFTProcessor::process_samples(std::shared_ptr<const SampleBlock> input_block)
 {
+    const SampleBlock &data = *input_block;
+
     if (m_sample_rate != data.sample_rate) {
         m_in_buffer.clear();
         m_sample_rate = data.sample_rate;
@@ -453,20 +407,25 @@ void FFTProcessor::process_samples(SampleBlock data)
 FFT::FFT(const Engine &engine, uint32_t size, uint32_t period_msec):
     m_processor(engine, size, period_msec)
 {
+    setObjectName(QString("sigalyze [FFT size=%1, period=%2ms]").arg(size).arg(period_msec));
     start();
     m_processor.moveToThread(this);
-    setObjectName(QString("sigalyze [FFT size=%1, period=%2ms]").arg(size).arg(period_msec));
 }
 
 
+/* NullOutputDriver */
 
+global_clock::time_point NullOutputDriver::time() const
+{
+    return global_clock::now() + m_latency;
+}
 
-/* AbstractOutputDriver */
-
-void AbstractOutputDriver::samples_available(const std::vector<float> &)
+void NullOutputDriver::write_samples(const std::vector<float> &)
 {
 
 }
+
+
 
 /* AudioOutputDriver */
 
@@ -481,22 +440,30 @@ AudioOutputDriver::AudioOutputDriver(
     m_samples_written(0),
     m_drop_samples(drop_msecs * m_output->format().sampleRate() / 1000),
     m_dropped(0),
-    m_time(global_clock::time_point())
+    m_outer_buffer_delay(0)
 {
+    m_output->setParent(this);
     uint32_t sample_rate = m_output->format().sampleRate();
-    m_output->setBufferSize(buffer_msecs * sample_rate / 1000 * sizeof(float));
+    uint32_t channel_count = m_output->format().channelCount();
+    m_output->setBufferSize(buffer_msecs * channel_count * sample_rate / 1000 * sizeof(float));
     m_sink = m_output->start();
     if (!m_sink) {
         throw std::runtime_error("failed to open audio output");
     }
     m_t0 = global_clock::now();
+    sample_rate = m_output->format().sampleRate();
+    channel_count = m_output->format().channelCount();
+    assert(m_output->bufferSize() % (sizeof(float)*sample_rate*channel_count) == 0);
     m_buffer_delay = std::chrono::microseconds(
-                m_output->bufferSize() / sizeof(float) * 1000000 / sample_rate);
-
-    m_clock_timer = startTimer(SAMPLING_INTERVAL, Qt::PreciseTimer);
+                m_output->bufferSize() / sizeof(float) * 1000000 / sample_rate / channel_count);
 }
 
-void AudioOutputDriver::samples_available(const std::vector<float> &samples)
+inline void AudioOutputDriver::update_buffer_delay()
+{
+    m_outer_buffer_delay = std::chrono::microseconds(m_outer_buffer.size() * 1000000 / m_output->format().sampleRate());
+}
+
+void AudioOutputDriver::write_samples(const std::vector<float> &samples)
 {
     if (!m_outer_buffer.empty()) {
         int64_t written = m_sink->write(
@@ -510,16 +477,20 @@ void AudioOutputDriver::samples_available(const std::vector<float> &samples)
     if (!m_outer_buffer.empty()) {
         const uint64_t total_samples = m_outer_buffer.size() + samples.size();
         if (total_samples >= m_drop_samples) {
+            m_outer_buffer.clear();
+            std::lock_guard<std::shared_timed_mutex> lock(m_time_mutex);
             m_dropped += std::chrono::microseconds(
                         total_samples * 1000000 / m_output->format().sampleRate()
                         );
-            m_outer_buffer.clear();
+            m_outer_buffer_delay = std::chrono::microseconds(0);
             std::cout << "dropped " << total_samples << " samples" << std::endl;
             return;
         }
         m_outer_buffer.reserve(m_outer_buffer.size() + samples.size());
         std::copy(samples.begin(), samples.end(),
                   std::back_inserter(m_outer_buffer));
+        std::lock_guard<std::shared_timed_mutex> lock(m_time_mutex);
+        update_buffer_delay();
         return;
     }
 
@@ -534,114 +505,191 @@ void AudioOutputDriver::samples_available(const std::vector<float> &samples)
                   samples.end(),
                   std::back_inserter(m_outer_buffer));
     }
+
+    std::lock_guard<std::shared_timed_mutex> lock(m_time_mutex);
+    update_buffer_delay();
 }
 
-void AudioOutputDriver::timerEvent(QTimerEvent *ev)
+global_clock::time_point AudioOutputDriver::time() const
 {
-    if (ev->timerId() == m_clock_timer) {
-        std::chrono::microseconds outer_buffer_delay(m_outer_buffer.size() * 1000000 / m_output->format().sampleRate());
-        m_time.store(
-                    m_t0 + std::chrono::microseconds(m_output->processedUSecs()) - m_buffer_delay - outer_buffer_delay + m_dropped,
-                    std::memory_order_release);
-        return;
+    std::shared_lock<std::shared_timed_mutex> lock(m_time_mutex);
+    return m_t0 + std::chrono::microseconds(m_output->processedUSecs()) - m_buffer_delay - m_outer_buffer_delay + m_dropped;
+}
+
+
+/* AudioPipe */
+
+AudioPipe::AudioPipe(std::unique_ptr<VirtualAudioSource> &&source,
+                     std::unique_ptr<AbstractOutputDriver> &&sink):
+    m_terminated(false),
+    m_new_source_thread(nullptr),
+    m_source(std::move(source)),
+    m_sink(std::move(sink))
+{
+    m_sample_sleep = std::chrono::microseconds(100 * 1000000 / m_source->sample_rate());
+    m_source->moveToThread(this);
+    m_sink->moveToThread(this);
+    setObjectName("sigalyze [AudioPipe]");
+    start();
+}
+
+AudioPipe::AudioPipe(std::unique_ptr<VirtualAudioSource> &&source,
+                     const std::chrono::milliseconds &output_delay):
+    AudioPipe::AudioPipe(std::move(source),
+                         std::make_unique<NullOutputDriver>(output_delay))
+{
+
+}
+
+AudioPipe::~AudioPipe()
+{
+    if (!m_terminated) {
+        m_terminated = true;
+        wait();
     }
-    AbstractOutputDriver::timerEvent(ev);
 }
 
-uint32_t AudioOutputDriver::sample_rate()
+void AudioPipe::downmix_to_mono(const std::vector<float> &src,
+                                std::vector<float> &dest,
+                                const uint32_t channels)
 {
-    return m_output->format().sampleRate();
+    assert(channels > 1);
+    dest.resize(src.size() / channels);
+    assert(src.size() % channels == 0);
+    for (uint32_t i = 0; i < src.size() / channels; ++i) {
+        float accum = 0.f;
+        for (uint32_t j = 0; j < channels; ++j) {
+            accum += src[i*channels+j];
+        }
+        dest[i] = accum;
+    }
 }
 
-std::chrono::_V2::steady_clock::time_point AudioOutputDriver::time()
+void AudioPipe::run()
 {
-    return m_time.load(std::memory_order_acquire);
+    while (!m_terminated) {
+        auto block = std::make_shared<SampleBlock>();
+        bool success;
+        std::tie(success, block->t) = m_source->read_samples(block->original_samples);
+        if (!success) {
+            throw std::runtime_error("failed to read from source");
+        }
+        if (block->original_samples.size() == 0) {
+            std::this_thread::sleep_for(m_sample_sleep);
+            continue;
+        }
+        const uint32_t channels = m_source->channel_count();
+        if (channels > 1) {
+            downmix_to_mono(block->original_samples,
+                            block->mono_samples,
+                            channels);
+        }
+        block->sample_rate = m_source->sample_rate();
+        emit samples_available(block);
+        m_sink->write_samples(block->original_samples);
+    }
+    if (m_new_source_thread) {
+        m_source->moveToThread(m_new_source_thread);
+    } else {
+        m_source = nullptr;
+    }
+    m_sink = nullptr;
+}
+
+std::unique_ptr<VirtualAudioSource> AudioPipe::stop(QThread &new_source_thread)
+{
+    if (!isRunning() || m_terminated) {
+        return nullptr;
+    }
+    m_new_source_thread = &new_source_thread;
+    m_terminated = true;
+    wait();
+    return std::move(m_source);
 }
 
 
 
 /* Engine */
 
-Engine::Engine():
-    m_sink(nullptr)
+Engine::Engine()
 {
+
 }
 
 Engine::~Engine()
 {
-    if (m_source) {
-        disconnect(m_source.get(), &VirtualAudioSource::samples_available,
-                   this, &Engine::on_samples_available);
-    }
+
 }
 
-void Engine::reopen_output()
+void Engine::rebuild_pipe()
 {
-    m_sink = nullptr;
+    std::unique_ptr<AbstractOutputDriver> sink = nullptr;
+    if (!m_output_device_info.isNull()) {
+        QAudioFormat fmt = m_output_device_info.preferredFormat();
+        fmt.setSampleType(QAudioFormat::Float);
+        fmt.setSampleSize(32);
+        fmt.setChannelCount(m_source_latch->channel_count());
+        fmt.setCodec("audio/pcm");
+        fmt.setByteOrder(QAudioFormat::LittleEndian);
+        fmt.setSampleRate(m_source_latch->sample_rate());
+        if (!m_output_device_info.isFormatSupported(fmt)) {
+            throw std::runtime_error("format not supported by sink");
+        }
 
-    if (m_output_device_info.isNull() or !m_source) {
-        return;
+        sink = std::make_unique<AudioOutputDriver>(
+                    std::make_unique<QAudioOutput>(m_output_device_info, fmt, this),
+                    1000,
+                    500);
+    } else {
+        sink = std::make_unique<NullOutputDriver>(std::chrono::milliseconds(1000));
     }
 
-    QAudioFormat fmt = m_output_device_info.preferredFormat();
-    fmt.setSampleType(QAudioFormat::Float);
-    fmt.setSampleSize(32);
-    fmt.setChannelCount(m_source->channel_count());
-    fmt.setCodec("audio/pcm");
-    fmt.setByteOrder(QAudioFormat::LittleEndian);
-    fmt.setSampleRate(m_source->sample_rate());
-    if (!m_output_device_info.isFormatSupported(fmt)) {
-        throw std::runtime_error("format not supported by sink");
-    }
-
-    m_sink = std::make_unique<AudioOutputDriver>(
-                std::make_unique<QAudioOutput>(m_output_device_info, fmt, this),
-                1000,
-                500,
-                this);
+    m_source_latch->start();
+    m_audio_pipe = std::make_unique<AudioPipe>(
+                std::move(m_source_latch),
+                std::move(sink));
+    connect(m_audio_pipe.get(), &AudioPipe::samples_available,
+            this, &Engine::samples_available);
 }
 
-void Engine::on_samples_available(const SampleBlock *samples)
+bool Engine::is_running() const
 {
-    if (m_sink) {
-        m_sink->samples_available(samples->original_samples);
-    }
-    samples_available(*samples);
+    return bool(m_audio_pipe);
 }
 
 void Engine::start()
 {
-    m_source->start();
-}
-
-void Engine::set_audio_output(const QAudioDeviceInfo &device)
-{
-    m_output_device_info = device;
-    reopen_output();
-}
-
-void Engine::set_source(std::unique_ptr<VirtualAudioSource> &&source)
-{
-    if (m_source) {
-        disconnect(m_source.get(), &VirtualAudioSource::samples_available,
-                   this, &Engine::on_samples_available);
+    if (m_audio_pipe) {
+        throw std::logic_error("already running");
     }
-    m_source = std::move(source);
-    if (m_source) {
-        connect(m_source.get(), &VirtualAudioSource::samples_available,
-                this, &Engine::on_samples_available,
-                Qt::DirectConnection);
+    if (!m_source_latch) {
+        throw std::logic_error("no source defined");
     }
-    source_changed(m_source.get());
-    reopen_output();
-}
-
-void Engine::set_target_output_latency(int32_t latency)
-{
-    reopen_output();
+    rebuild_pipe();
 }
 
 void Engine::stop()
 {
-    m_source->stop();
+    if (!m_audio_pipe) {
+        throw std::logic_error("already stopped");
+    }
+    m_source_latch = m_audio_pipe->stop(*thread());
+    m_source_latch->stop();
+    m_audio_pipe = nullptr;
+}
+
+void Engine::set_source(std::unique_ptr<VirtualAudioSource> &&source)
+{
+    if (m_audio_pipe) {
+        throw std::logic_error("already running");
+    }
+    m_source_latch = std::move(source);
+}
+
+void Engine::set_output_device(const QAudioDeviceInfo &device)
+{
+    if (m_audio_pipe) {
+        throw std::logic_error("already running");
+    }
+    m_output_device_info = device;
 }

@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <queue>
 #include <iostream>
 
@@ -53,25 +54,20 @@ class VirtualAudioSource: public QObject
     Q_OBJECT
 public:
     using QObject::QObject;
-    virtual ~VirtualAudioSource() = default;
 
 public:
     virtual uint32_t channel_count() const = 0;
-    virtual bool is_seekable() const;
-    virtual void pause() = 0;
-    virtual bool read_samples(uint64_t start, uint64_t count,
-                              std::vector<float> &dest);
-    virtual void resume() = 0;
     virtual uint32_t sample_rate() const = 0;
-    virtual uint64_t samples() const;
-    virtual void seek(uint64_t sample);
+    virtual bool is_seekable() const;
+    virtual bool seek(const uint64_t to_frame);
+    virtual uint64_t tell() const;
+
     virtual void start() = 0;
-    virtual QAudio::State state() const;
     virtual void stop() = 0;
 
-signals:
-    void samples_available(const SampleBlock *samples);
-    void state_changed(QAudio::State new_state);
+public:
+    virtual std::pair<bool, global_clock::time_point> read_samples(
+            std::vector<float> &dest) = 0;
 
 };
 
@@ -82,7 +78,7 @@ public:
     virtual ~AbstractSampleConverter();
 
 public:
-    virtual void read_and_convert(QIODevice *source,
+    virtual bool read_and_convert(QIODevice *source,
                                   uint32_t bytes_to_read,
                                   std::vector<float> &dest) = 0;
 
@@ -102,27 +98,22 @@ public:
     ~AudioInputSource() override;
 
 private:
+    global_clock::time_point m_t0;
+    std::chrono::microseconds m_buffer_delay;
     std::unique_ptr<QAudioInput> m_input;
     QIODevice *m_source;
     std::unique_ptr<AbstractSampleConverter> m_converter;
-    SampleBlock m_buffer;
-    int m_sampling_timer;
+    uint64_t m_frames_read;
 
 private:
-    void downmix_to_mono(const std::vector<float> &src, std::vector<float> &dest);
-    void on_notify();
+    global_clock::time_point time() const;
 
-    // QObject interface
-protected:
-    void timerEvent(QTimerEvent *ev);
-
+    // VirtualAudioSource interface
 public:
     uint32_t channel_count() const;
-    void pause();
-    void resume();
     uint32_t sample_rate() const;
+    std::pair<bool, global_clock::time_point> read_samples(std::vector<float> &dest);
     void start();
-    QAudio::State state() const;
     void stop();
 };
 
@@ -194,7 +185,7 @@ private:
     decltype(m_backlog)::size_type m_backlog_index;
 
 private slots:
-    void process_samples(SampleBlock data);
+    void process_samples(std::shared_ptr<const SampleBlock> input_block);
 
 private:
     float get_recent_peak();
@@ -260,7 +251,7 @@ private:
     void make_window(std::vector<double> &dest);
 
 private slots:
-    void process_samples(SampleBlock data);
+    void process_samples(std::shared_ptr<const SampleBlock> input_block);
 
 signals:
     void result_available(RealFFTBlock data);
@@ -301,11 +292,34 @@ public:
     using QObject::QObject;
 
 public:
-    virtual uint32_t sample_rate() = 0;
-    virtual global_clock::time_point time() = 0;
+    virtual global_clock::time_point time() const = 0;
 
 public:
-    virtual void samples_available(const std::vector<float> &samples);
+    virtual void write_samples(const std::vector<float> &samples) = 0;
+
+};
+
+
+class NullOutputDriver: public AbstractOutputDriver
+{
+    Q_OBJECT
+public:
+    template <typename duration_t>
+    explicit NullOutputDriver(duration_t &&latency, QObject *parent = nullptr):
+        AbstractOutputDriver(parent),
+        m_latency(std::forward<duration_t>(latency))
+    {
+
+    }
+
+private:
+    std::chrono::milliseconds m_latency;
+
+public:
+    global_clock::time_point time() const override;
+
+public:
+    void write_samples(const std::vector<float> &samples) override;
 
 };
 
@@ -325,25 +339,67 @@ private:
     QIODevice *m_sink;
     int64_t m_samples_written;
     uint32_t m_drop_samples;
-    std::chrono::microseconds m_buffer_delay;
-    std::chrono::microseconds m_dropped;
     global_clock::time_point m_t0;
-    std::atomic<global_clock::time_point> m_time;
     std::vector<float> m_outer_buffer;
+    std::chrono::microseconds m_buffer_delay;
 
-    int m_clock_timer;
+    mutable std::shared_timed_mutex m_time_mutex;
+    std::chrono::microseconds m_dropped;
+    std::chrono::microseconds m_outer_buffer_delay;
+
+private:
+    void update_buffer_delay();
 
 public:
-    void samples_available(const std::vector<float> &samples) override;
-
-    // QObject interface
-protected:
-    void timerEvent(QTimerEvent *);
+    void write_samples(const std::vector<float> &samples) override;
 
     // AbstractOutputDriver interface
 public:
-    uint32_t sample_rate() override;
-    std::chrono::_V2::steady_clock::time_point time() override;
+    global_clock::time_point time() const override;
+
+};
+
+
+class AudioPipe: public QThread
+{
+    Q_OBJECT
+public:
+    AudioPipe(
+            std::unique_ptr<VirtualAudioSource> &&source,
+            std::unique_ptr<AbstractOutputDriver> &&sink);
+    explicit AudioPipe(std::unique_ptr<VirtualAudioSource> &&source,
+            const std::chrono::milliseconds &output_delay = std::chrono::milliseconds(100));
+    ~AudioPipe() override;
+
+private:
+    std::atomic_bool m_terminated;
+    QThread *m_new_source_thread;
+    std::chrono::microseconds m_sample_sleep;
+
+    std::unique_ptr<VirtualAudioSource> m_source;
+    std::unique_ptr<AbstractOutputDriver> m_sink;
+
+private:
+    void downmix_to_mono(const std::vector<float> &src,
+                         std::vector<float> &dest,
+                         uint32_t channels);
+    std::shared_lock<std::shared_timed_mutex> wait_for_source_and_sink();
+
+    // QThread interface
+protected:
+    void run();
+
+public:
+    inline global_clock::time_point sink_time() const
+    {
+        return m_sink->time();
+    }
+
+public:
+    std::unique_ptr<VirtualAudioSource> stop(QThread &new_source_thread);
+
+signals:
+    void samples_available(std::shared_ptr<const SampleBlock> block);
 
 };
 
@@ -354,42 +410,33 @@ class Engine: public QObject
 
 public:
     Engine();
-    ~Engine();
+    ~Engine() override;
 
 private:
-    std::unique_ptr<VirtualAudioSource> m_source;
+    std::unique_ptr<VirtualAudioSource> m_source_latch;
+
+    std::unique_ptr<AudioPipe> m_audio_pipe;
     QAudioDeviceInfo m_output_device_info;
-    std::unique_ptr<AbstractOutputDriver> m_sink;
 
 private:
-    void reopen_output();
-
-private slots:
-    void on_samples_available(const SampleBlock *samples);
+    void rebuild_pipe();
 
 public:
-    inline global_clock::time_point output_time() const
+    inline global_clock::time_point sink_time() const
     {
-        return (m_sink ? m_sink->time() : global_clock::now());
+        return m_audio_pipe->sink_time();
     }
 
-    void resume();
-
-    inline const VirtualAudioSource *source() const
-    {
-        return m_source.get();
-    }
+    bool is_running() const;
 
     void start();
-    void set_audio_output(const QAudioDeviceInfo &device);
-    void set_source(std::unique_ptr<VirtualAudioSource> &&source);
-    void set_target_output_latency(int32_t latency);
     void stop();
-    void suspend();
+
+    void set_source(std::unique_ptr<VirtualAudioSource> &&source);
+    void set_output_device(const QAudioDeviceInfo &device);
 
 signals:
-    void samples_available(SampleBlock samples);
-    void source_changed(const VirtualAudioSource *new_source);
+    void samples_available(std::shared_ptr<const SampleBlock> samples);
 
 };
 

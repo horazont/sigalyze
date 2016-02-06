@@ -88,9 +88,11 @@ void RMSWidget::push_value(RMSBlock data)
     update();
 }
 
-void RMSWidget::paintEvent(QPaintEvent *ev)
+void RMSWidget::paintEvent(QPaintEvent*)
 {
-    m_queue.fetch_up_to(m_engine.output_time(), OverrideIterator<RMSBlock>(&m_most_recent));
+    if (m_engine.is_running()) {
+        m_queue.fetch_up_to(m_engine.sink_time(), OverrideIterator<RMSBlock>(&m_most_recent));
+    }
 
     const float curr_db = m_context.map_db(20*std::log10(m_most_recent.curr));
     const float peak_db = m_context.map_db(20*std::log10(m_most_recent.recent_peak));
@@ -115,7 +117,7 @@ FFTWidget::FFTWidget(const Engine &engine,
     QOpenGLWidget(parent),
     m_engine(engine),
     m_context(context),
-    m_queue(32),
+    m_queue(128),
     m_data(QOpenGLTexture::Target1D)
 {
     setMinimumHeight(250);
@@ -168,7 +170,9 @@ void FFTWidget::initializeGL()
 
 void FFTWidget::paintGL()
 {
-    m_queue.fetch_up_to(m_engine.output_time(), OverrideIterator<RealFFTBlock>(&m_most_recent));
+    if (m_engine.is_running()) {
+        m_queue.fetch_up_to(m_engine.sink_time(), OverrideIterator<RealFFTBlock>(&m_most_recent));
+    }
 
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
@@ -307,31 +311,33 @@ void WaterfallWidget::paintGL()
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
 
-    m_queue.fetch_up_to(m_engine.output_time(),
-                        std::back_inserter(m_most_recent));
-    if (m_most_recent.size() > 0 and m_data.textureId() == 0) {
-        m_data.create();
-        m_data.bind();
-        m_data.setSize(
-                    m_most_recent[0].fft.size(),
-                ROWS_PER_LAYER);
-        m_data.setLayers(MAX_LAYERS);
-        m_data.setFormat(QOpenGLTexture::R32F);
-        m_data.allocateStorage();
-        m_data.setMagnificationFilter(QOpenGLTexture::Linear);
-        m_data.setMinificationFilter(QOpenGLTexture::Linear);
-    } else if (m_data.textureId() != 0) {
-        m_data.bind();
+    if (m_engine.is_running()) {
+        m_queue.fetch_up_to(m_engine.sink_time(),
+                            std::back_inserter(m_most_recent));
+        if (m_most_recent.size() > 0 and m_data.textureId() == 0) {
+            m_data.create();
+            m_data.bind();
+            m_data.setSize(
+                        m_most_recent[0].fft.size(),
+                    ROWS_PER_LAYER);
+            m_data.setLayers(MAX_LAYERS);
+            m_data.setFormat(QOpenGLTexture::R32F);
+            m_data.allocateStorage();
+            m_data.setMagnificationFilter(QOpenGLTexture::Linear);
+            m_data.setMinificationFilter(QOpenGLTexture::Linear);
+        } else if (m_data.textureId() != 0) {
+            m_data.bind();
+        }
+        for (const RealFFTBlock &row: m_most_recent) {
+            m_buffer.clear();
+            m_buffer.reserve(row.fft.size());
+            std::copy(row.fft.begin(),
+                      row.fft.end(),
+                      std::back_inserter(m_buffer));
+            append_row(m_buffer);
+        }
+        m_most_recent.clear();
     }
-    for (const RealFFTBlock &row: m_most_recent) {
-        m_buffer.clear();
-        m_buffer.reserve(row.fft.size());
-        std::copy(row.fft.begin(),
-                  row.fft.end(),
-                  std::back_inserter(m_buffer));
-        append_row(m_buffer);
-    }
-    m_most_recent.clear();
 
     m_shader.setUniformValue("dB_min", m_context.dB_min);
     m_shader.setUniformValue("dB_max", m_context.dB_max);
@@ -373,10 +379,10 @@ MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
     m_latency_label(nullptr),
     m_rms_calc(m_engine),
-    m_fft_calc(m_engine, 4096, 50)
+    m_fft_calc(m_engine, 4096, 25)
 {
     ui.setupUi(this);
-    m_engine.set_audio_output(QAudioDeviceInfo::defaultOutputDevice());
+    m_engine.set_output_device(QAudioDeviceInfo::defaultOutputDevice());
     m_context.dB_min = -192;
     m_context.dB_max = 0;
     m_stats_timer = startTimer(1000);
@@ -422,9 +428,13 @@ void MainWindow::on_action_open_audio_device_triggered()
 void MainWindow::timerEvent(QTimerEvent *ev)
 {
     if (ev->timerId() == m_stats_timer) {
-        m_latency_label->setText(
-                    QString("Output latency: %1 ms").arg(std::chrono::duration_cast<std::chrono::duration<float, std::ratio<1, 1000> > >(global_clock::now() - m_engine.output_time()).count())
-                    );
+        if (m_engine.is_running()) {
+            m_latency_label->setText(
+                        QString("Output latency: %1 ms").arg(std::chrono::duration_cast<std::chrono::duration<float, std::ratio<1, 1000> > >(global_clock::now() - m_engine.sink_time()).count())
+                        );
+        } else {
+            m_latency_label->setText("idle");
+        }
         return;
     }
     QMainWindow::timerEvent(ev);
