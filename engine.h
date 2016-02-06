@@ -31,7 +31,6 @@ struct SampleBlock: public TimestampedData
 {
     uint32_t sample_rate;
     std::vector<float> mono_samples;
-    std::vector<float> original_samples;
 };
 
 
@@ -94,10 +93,17 @@ class AudioInputSource: public VirtualAudioSource
     Q_OBJECT
 
 public:
-    explicit AudioInputSource(std::unique_ptr<QAudioInput> &&from, QObject *parent = nullptr);
+    AudioInputSource(const QAudioDeviceInfo &device,
+                     const QAudioFormat &format,
+                     const float initial_volume,
+                     QObject *parent = nullptr);
     ~AudioInputSource() override;
 
 private:
+    QAudioDeviceInfo m_device;
+    QAudioFormat m_format;
+    float m_volume;
+
     global_clock::time_point m_t0;
     std::chrono::microseconds m_buffer_delay;
     std::unique_ptr<QAudioInput> m_input;
@@ -115,6 +121,7 @@ public:
     std::pair<bool, global_clock::time_point> read_samples(std::vector<float> &dest);
     void start();
     void stop();
+
 };
 
 
@@ -207,6 +214,7 @@ public:
     RootMeanSquare(RootMeanSquare &&src) = delete;
     RootMeanSquare &operator=(const RootMeanSquare &other) = delete;
     RootMeanSquare &operator=(RootMeanSquare &&src) = delete;
+    ~RootMeanSquare() override;
 
 private:
     RMSProcessor m_processor;
@@ -242,6 +250,7 @@ private:
     global_clock::time_point m_t;
     uint32_t m_sample_rate;
     uint32_t m_shift_remaining;
+    double m_norm;
 
     std::vector<double> m_in_buffer;
     std::vector<double> m_window;
@@ -272,6 +281,7 @@ public:
     FFT(FFT &&src) = delete;
     FFT &operator=(const FFT &other) = delete;
     FFT &operator=(FFT &&src) = delete;
+    ~FFT() override;
 
 private:
     FFTProcessor m_processor;
@@ -292,6 +302,8 @@ public:
     using QObject::QObject;
 
 public:
+    virtual void start() = 0;
+    virtual void stop() = 0;
     virtual global_clock::time_point time() const = 0;
 
 public:
@@ -316,6 +328,8 @@ private:
     std::chrono::milliseconds m_latency;
 
 public:
+    void start() override;
+    void stop() override;
     global_clock::time_point time() const override;
 
 public:
@@ -329,12 +343,18 @@ class AudioOutputDriver: public AbstractOutputDriver
     Q_OBJECT
 public:
     explicit AudioOutputDriver(
-            std::unique_ptr<QAudioOutput> &&output,
+            const QAudioDeviceInfo &device,
+            const QAudioFormat &format,
             int32_t buffer_msecs = 100,
             uint32_t drop_msecs = 1000,
             QObject *parent = nullptr);
 
 private:
+    QAudioDeviceInfo m_device;
+    QAudioFormat m_format;
+    int32_t m_buffer_msecs;
+    uint32_t m_drop_msecs;
+
     std::unique_ptr<QAudioOutput> m_output;
     QIODevice *m_sink;
     int64_t m_samples_written;
@@ -355,6 +375,8 @@ public:
 
     // AbstractOutputDriver interface
 public:
+    void start() override;
+    void stop() override;
     global_clock::time_point time() const override;
 
 };
@@ -378,6 +400,13 @@ private:
 
     std::unique_ptr<VirtualAudioSource> m_source;
     std::unique_ptr<AbstractOutputDriver> m_sink;
+
+    std::mutex m_startup_mutex;
+    std::condition_variable m_startup_notify;
+    bool m_startup_done;
+
+private: // for use from within the thread only!
+    std::vector<float> m_sample_buffer;
 
 private:
     void downmix_to_mono(const std::vector<float> &src,

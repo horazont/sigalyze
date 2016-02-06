@@ -15,7 +15,7 @@ OpenAudioDeviceDialog::OpenAudioDeviceDialog(QWidget *parent) :
     ui.setupUi(this);
     ui.device_list->setModel(&m_model);
     connect(ui.device_list->selectionModel(), &QItemSelectionModel::currentChanged,
-            this, &OpenAudioDeviceDialog::on_device_list_selection_model_current_changed);
+            this, &OpenAudioDeviceDialog::device_list_selection_model_current_changed);
 }
 
 void OpenAudioDeviceDialog::update_buttons()
@@ -68,7 +68,7 @@ QAudioFormat OpenAudioDeviceDialog::format() const
     return m_selected_format;
 }
 
-void OpenAudioDeviceDialog::on_device_list_selection_model_current_changed(
+void OpenAudioDeviceDialog::device_list_selection_model_current_changed(
         QModelIndex current,
         QModelIndex)
 {
@@ -137,6 +137,8 @@ void OpenAudioDeviceDialog::on_device_list_selection_model_current_changed(
     }
     ui.sample_type->setCurrentIndex(preferred_index);
 
+    ui.allow_stereo->setChecked(preferred.channelCount() > 1);
+
     update_buttons();
 }
 
@@ -170,7 +172,7 @@ void OpenAudioDeviceDialog::accept()
     m_selected_format = m_selected_device.preferredFormat();
     m_selected_format.setByteOrder(QAudioFormat::LittleEndian);
     m_selected_format.setCodec("audio/pcm");
-    m_selected_format.setChannelCount(2);
+    m_selected_format.setChannelCount(m_selected_format.channelCount() > 1 && ui.allow_stereo->checkState() == Qt::Checked ? 2 : 1);
     m_selected_format.setSampleRate(ui.sample_rate->currentData().toInt());
     m_selected_format.setSampleSize(ui.sample_size->currentData().toInt());
     m_selected_format.setSampleType((QAudioFormat::SampleType)ui.sample_type->currentData().toInt());

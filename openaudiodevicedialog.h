@@ -28,10 +28,9 @@ public:
     QAudioDeviceInfo device() const;
     QAudioFormat format() const;
 
-public slots:
-    void on_device_list_selection_model_current_changed(QModelIndex current,
-                                                        QModelIndex previous);
 private slots:
+    void device_list_selection_model_current_changed(QModelIndex current,
+                                                     QModelIndex previous);
     void on_sample_rate_currentIndexChanged(int index);
     void on_sample_size_currentIndexChanged(int index);
     void on_sample_type_currentIndexChanged(int index);

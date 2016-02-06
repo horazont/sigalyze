@@ -73,7 +73,7 @@
      <item row="2" column="0">
       <widget class="QLabel" name="label_3">
        <property name="text">
-        <string>Sample type</string>
+        <string>Sa&amp;mple type</string>
        </property>
        <property name="buddy">
         <cstring>sample_type</cstring>
@@ -82,6 +82,13 @@
      </item>
      <item row="2" column="1">
       <widget class="QComboBox" name="sample_type"/>
+     </item>
+     <item row="3" column="0" colspan="2">
+      <widget class="QCheckBox" name="allow_stereo">
+       <property name="text">
+        <string>Allow stereo</string>
+       </property>
+      </widget>
      </item>
     </layout>
    </item>

@@ -417,10 +417,13 @@ void MainWindow::on_action_open_audio_device_triggered()
         return;
     }
 
-    m_engine.set_source(std::make_unique<AudioInputSource>(std::make_unique<QAudioInput>(
-                                                               m_audio_device_dialog.device(),
-                                                               m_audio_device_dialog.format()
-                                                               )));
+    if (m_engine.is_running()) {
+        m_engine.stop();
+    }
+    m_engine.set_source(std::make_unique<AudioInputSource>(
+                            m_audio_device_dialog.device(),
+                            m_audio_device_dialog.format(),
+                            0.001));
     m_engine.start();
     m_context.dB_min = -std::log10(2ULL << (uint64_t)m_audio_device_dialog.format().sampleSize())*20;
 }

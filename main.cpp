@@ -22,9 +22,12 @@ int main(int argc, char *argv[])
     fmt.setSamples(2);
     QSurfaceFormat::setDefaultFormat(fmt);
 
+    QThread::currentThread()->setObjectName("sigalyze [main]");
+
     QApplication a(argc, argv);
     MainWindow w;
     w.show();
+
 
     return a.exec();
 }
